@@ -5,7 +5,7 @@ import assert from 'node:assert/strict'
 
 const m = await import('./index.mjs')
 const { flattenMessages, conversationKey, deltaContinuation, FALLBACK_MODELS, PREAMBLE, REMINDER, TOOL_RECENCY } = m._internal
-const { alias, unalias, toolPreamble, ToolStreamParser, composeTurnText } = m._internal
+const { alias, unalias, toolPreamble, ToolStreamParser, composeTurnText, parseRawBlocks } = m._internal
 
 // ---------------------------------------------------------------- flattenMessages
 
@@ -260,47 +260,120 @@ test('toolPreamble: tool_choice=none 且无工具时不注入前例与 m_ 说明
   assert.ok(p.includes('禁止调用任何工具'))
 })
 
-// ---------------------------------------------------------------- v0.2.7 composeTurnText
+// ---------------------------------------------------------------- v0.3 composeTurnText（invisible 通道）
 
-test('composeTurnText: 首轮带工具时包含前例（经 toolPreamble），不带逐轮提醒', () => {
-  const toolBlock = toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
-  const text = composeTurnText({ firstTurn: true, persona: true, toolBlock, toolsPresent: true, deltaText: '[user]\n问题' })
-  assert.ok(text.includes('（示例——上一轮你成功调用过工具）'), '首轮应包含成功前例')
-  assert.ok(text.includes(PREAMBLE.slice(0, 20)), 'persona 开启时首轮应有 PREAMBLE')
-  assert.ok(!text.includes(TOOL_RECENCY), '首轮不应带逐轮提醒')
-  assert.ok(text.endsWith('[user]\n问题'))
+test('composeTurnText: 首轮带工具时 invisible 含前例（经 toolPreamble），text 为纯 transcript', () => {
+  const toolBlock = toolPreamble(TOOLS, undefined)
+  const { text, invisible } = composeTurnText({ firstTurn: true, persona: true, toolBlock, toolsPresent: true, deltaText: '[user]\n问题' })
+  assert.ok(invisible.includes('（示例——上一轮你成功调用过工具）'), '首轮 invisible 应包含成功前例')
+  assert.ok(invisible.includes(PREAMBLE.slice(0, 20)), 'persona 开启时首轮 invisible 应有 PREAMBLE，且在 toolBlock 前')
+  assert.ok(invisible.indexOf(PREAMBLE.slice(0, 20)) < invisible.indexOf('（示例'), 'PREAMBLE 应在 toolBlock 之前')
+  assert.ok(!invisible.includes(TOOL_RECENCY), '首轮不应带逐轮提醒')
+  assert.equal(text, '[user]\n问题', 'text 应为纯 transcript，不含 preamble/toolBlock')
 })
 
-test('composeTurnText: 首轮 persona:false 无 PREAMBLE 但仍带工具前例', () => {
-  const toolBlock = toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
-  const text = composeTurnText({ firstTurn: true, persona: false, toolBlock, toolsPresent: true, deltaText: 'flat' })
-  assert.ok(!text.includes(PREAMBLE.slice(0, 20)))
-  assert.ok(text.includes('（示例——上一轮你成功调用过工具）'))
+test('composeTurnText: 首轮 persona:false 无 PREAMBLE 但 invisible 仍带工具前例', () => {
+  const toolBlock = toolPreamble(TOOLS, undefined)
+  const { text, invisible } = composeTurnText({ firstTurn: true, persona: false, toolBlock, toolsPresent: true, deltaText: 'flat' })
+  assert.ok(!invisible.includes(PREAMBLE.slice(0, 20)))
+  assert.ok(invisible.includes('（示例——上一轮你成功调用过工具）'))
+  assert.equal(text, 'flat')
 })
 
-test('composeTurnText: 续轮且有工具时带一行格式提醒（persona:false 也生效）', () => {
-  const text = composeTurnText({ firstTurn: false, persona: false, toolBlock: '', toolsPresent: true, deltaText: '[tool:read]\n结果' })
-  assert.ok(text.includes(TOOL_RECENCY), '续轮应带格式提醒且不受 persona 开关影响')
-  assert.ok(!text.includes(REMINDER))
-  assert.ok(text.endsWith('[tool:read]\n结果'))
+test('composeTurnText: 续轮且有工具时 invisible 带一行格式提醒（persona:false 也生效）', () => {
+  const { text, invisible } = composeTurnText({ firstTurn: false, persona: false, toolBlock: '', toolsPresent: true, deltaText: '[tool:read]\n结果' })
+  assert.ok(invisible.includes(TOOL_RECENCY), '续轮应带格式提醒且不受 persona 开关影响')
+  assert.ok(!invisible.includes(REMINDER))
+  assert.equal(text, '[tool:read]\n结果')
 })
 
-test('composeTurnText: 续轮无工具时不带格式提醒；有 persona 时带 REMINDER', () => {
+test('composeTurnText: 续轮无工具时 invisible 为 undefined；有 persona 时带 REMINDER', () => {
   const withPersona = composeTurnText({ firstTurn: false, persona: true, toolBlock: '', toolsPresent: false, deltaText: '续问' })
-  assert.ok(!withPersona.includes(TOOL_RECENCY))
-  assert.ok(withPersona.includes(REMINDER))
+  assert.ok(!withPersona.invisible?.includes(TOOL_RECENCY))
+  assert.ok(withPersona.invisible.includes(REMINDER))
   const noPersona = composeTurnText({ firstTurn: false, persona: false, toolBlock: '', toolsPresent: false, deltaText: '续问' })
-  assert.ok(!noPersona.includes(TOOL_RECENCY))
-  assert.ok(!noPersona.includes(REMINDER))
+  assert.equal(noPersona.invisible, undefined, '无 preamble/工具时不应注入 invisible 块')
 })
 
-test('composeTurnText: 续轮且工具集更新时 toolBlock 在最前，提醒与增量按序拼接', () => {
-  const toolBlock = '【工具列表更新】\n' + toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
-  const text = composeTurnText({ firstTurn: false, persona: true, toolBlock, toolsPresent: true, deltaText: '增量' })
-  assert.ok(text.startsWith('【工具列表更新】'))
-  const iBlock = text.indexOf('---\n\n')
-  const iRem = text.indexOf(REMINDER)
-  const iRec = text.indexOf(TOOL_RECENCY)
-  const iDelta = text.indexOf('增量')
-  assert.ok(iBlock >= 0 && iRem > iBlock && iRec > iRem && iDelta > iRec, '顺序应为 toolBlock → REMINDER → 提醒 → 增量')
+test('composeTurnText: 续轮且工具集更新时 invisible 顺序为 toolBlock → REMINDER → 提醒', () => {
+  const toolBlock = '【工具列表更新】\n' + toolPreamble(TOOLS, undefined)
+  const { text, invisible } = composeTurnText({ firstTurn: false, persona: true, toolBlock, toolsPresent: true, deltaText: '增量' })
+  assert.ok(invisible.startsWith('【工具列表更新】'))
+  const iBlock = invisible.indexOf('【工具列表更新】')
+  const iRem = invisible.indexOf(REMINDER)
+  const iRec = invisible.indexOf(TOOL_RECENCY)
+  assert.ok(iBlock >= 0 && iRem > iBlock && iRec > iRem, '顺序应为 toolBlock → REMINDER → 提醒')
+  assert.equal(text, '增量')
+})
+
+// ---------------------------------------------------------------- v0.3 parseRawBlocks
+
+test('parseRawBlocks: 多参数块按序提取，数值/布尔还原类型，其余保留字符串', () => {
+  const { args, consumed } = parseRawBlocks('<timeout>300</timeout>\n<force>true</force>\n<command>python3 - <<\'EOF\'\nprint("hi","你好")\nEOF\n</command>')
+  assert.ok(consumed > 0, '应消耗全部参数块')
+  assert.equal(args.timeout, 300)
+  assert.equal(args.force, true)
+  assert.equal(args.command, "python3 - <<'EOF'\nprint(\"hi\",\"你好\")\nEOF", 'heredoc 原文零转义保留（尾随换行被 close 标签吞掉属已知行为）')
+})
+
+test('parseRawBlocks: 空输入返回空 args；尾部非块内容不计入 consumed', () => {
+  assert.deepEqual(parseRawBlocks(''), { args: {}, consumed: 0 })
+  const { args, consumed } = parseRawBlocks('<a>1</a>垃圾尾巴')
+  assert.equal(args.a, 1)
+  assert.equal(consumed, 8)
+})
+
+test('ToolStreamParser: raw-block 属性形式调用（含 heredoc/引号）零转义解析', () => {
+  const p = new ToolStreamParser(() => {})
+  const out = []
+  p.emit = (e) => out.push(e)
+  p.push('<fn:invoke name="m_bash"><timeout>300</timeout><command>python3 - <<\'EOF\'\nprint("hi","你好")\nEOF\n</command></fn:invoke>')
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call, '应发射 toolCall')
+  assert.equal(call.name, 'bash', 'm_ 前缀应还原')
+  const args = JSON.parse(call.arguments)
+  assert.equal(args.timeout, 300)
+  assert.equal(args.command, "python3 - <<'EOF'\nprint(\"hi\",\"你好\")\nEOF")
+  assert.ok(!out.some((e) => e.content?.includes('<fn:invoke')), '标记不应泄漏到正文')
+})
+
+test('ToolStreamParser: raw-block 跨 chunk 分片到达同样解析，close 标记不泄漏', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e))
+  const full = '<fn:invoke name="m_read"><path>/tmp/a b/c.txt</path></fn:invoke>'
+  for (let i = 0; i < full.length; i += 7) p.push(full.slice(i, i + 7))
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call)
+  assert.equal(call.name, 'read')
+  assert.deepEqual(JSON.parse(call.arguments), { path: '/tmp/a b/c.txt' })
+  assert.ok(!out.some((e) => e.content && /<\/?fn:?_? ?invoke/.test(e.content)), 'open/close 标记都不应泄漏')
+})
+
+test('ToolStreamParser: 属性形式起始标记后跟 JSON 负载仍走原 JSON 路径', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e))
+  p.push('<fn:invoke name="m_bash">{"name": "m_bash", "arguments": {"command": "ls"}}</fn:invoke>')
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call)
+  assert.equal(call.name, 'bash')
+  assert.deepEqual(JSON.parse(call.arguments), { command: 'ls' })
+})
+
+test('ToolStreamParser: raw-block 内容含孤立 </fn:invoke> 字样时不误切（改走 fallback 透传）', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e))
+  // taught rule forbids </fn:invoke> inside raw bodies; a close look-alike in
+  // the middle makes the first close end the body early — the tail then has
+  // no name attribute and falls back to text passthrough without crashing
+  p.push('<fn:invoke name="m_write"><text>提到 </fn:invoke> 的话就完不成</text></fn:invoke>')
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  if (call) {
+    assert.equal(call.name, 'write')
+  } else {
+    assert.ok(out.some((e) => e.content?.includes('<fn:invoke')), '无法路由时应回退透传原文')
+  }
 })

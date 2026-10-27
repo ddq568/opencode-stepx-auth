@@ -17,7 +17,8 @@
  *       GET  /api/identity/me            -> {userId, nickname}
  *   - WS    wss://studio-api.stepx.com/ws (cookie auth)
  *       -> {type:"project.switch", projectId, payload:{projectSwitch:{resumeSeq:{}}}}
- *       -> {type:"chat.send", projectId, sessionId?, payload:{chatSend:{doc:{blocks:[{text}]}, model?}}, userLocale}
+ *       -> {type:"chat.send", projectId, sessionId?,
+ *           payload:{chatSend:{doc:{blocks:[{ref:{kind:"invisibleText",text}}?, {text}]}, model?}}, userLocale}
  *       <- {type:"ack"|"chat.queued"}                      (turn accepted)
  *       <- {type:"message.append", payload:{messageAppend:{kind:"user"|"thinking"|"text", delta}}}
  *       <- {type:"context.update", payload:{contextUpdate:{model,totalTokens,maxTokens}}}
@@ -32,6 +33,11 @@
  *     that extend the previous request's text send only the delta, keeping
  *     the Studio session in lockstep with the agent's growing history.
  *   - kind:"thinking" deltas -> reasoning_content; kind:"text" -> content.
+ *   - v0.3: PREAMBLE/REMINDER and the tool protocol ride in an invisibleText
+ *     ref block ahead of the visible text (server-verified), so `text` stays
+ *     the pure conversation transcript; tool parameters may use the raw-block
+ *     format <fn:invoke name="m_x"><key>value</key></fn:invoke> — no JSON
+ *     escaping needed for long commands/scripts.
  *
  * Options (magpie plugin options stepx '{"…"}'):
  *   { "chromePath": "C:/path/chrome.exe" }  browser used by the guided sign-in
@@ -214,7 +220,10 @@ const CLOSE_TAIL_HEADS = ['</fn invoke', '</fn_invoke', '</fn:invoke', '</tool_c
 // "name" key, never from the trigger tail.
 const SEP = '[ \\t_:\\-]'
 const TOOL_TRIGGER_RE = new RegExp(
-  '<[ \\t]{0,4}(?:fn' + SEP + '{0,2}invoke|tool' + SEP + '{0,2}calls?)[ \\t]{0,2}>?' +
+  '<[ \\t]{0,4}(?:fn' + SEP + '{0,2}invoke|tool' + SEP + '{0,2}calls?)' +
+    // attribute form: <fn:invoke name="x" …> (v0.3 raw-block format A)
+    '(?:' + SEP + '{1,2}name[ \\t]*=[ \\t]*[\\x22\\x27][^\\x22\\x27\\n]{0,80}[\\x22\\x27]?)?' +
+    '[ \\t]{0,2}>?' +
   '|\\[[ \\t]{0,4}(?:fn' + SEP + '{1,2}invoke|tool' + SEP + '{1,2}calls?)[ \\t]{0,4}\\]',
   'i',
 )
@@ -285,12 +294,19 @@ function toolPreamble(tools, toolChoice) {
   }
   lines.push(
     '调用规则：',
-    '- 需要工具时，你的可见回复必须是工具调用块本身（不要写在代码围栏里，不要加任何解释文字），格式严格如下：',
+    '- 需要工具时，你的可见回复必须是工具调用块本身（不要写在代码围栏里，不要加任何解释文字）。调用格式有两种：',
+    '- 调用格式A（参数含长命令/脚本/多行文本时优先）：',
+    '<fn:invoke name="函数名">',
+    '<参数名>参数原文（任意内容直接写，不需要任何转义）</参数名>',
+    '<另一个参数名>值</另一个参数名>',
+    '</fn:invoke>',
+    '- 调用格式B（参数简单时也可以用 JSON）：',
     '<fn:invoke>',
     '{"name": "函数名", "arguments": {参数对象}}',
     '</fn:invoke>',
     '- 工具调用块必须是你回复的第一个非空白内容：不要先写"我来…"、"让我…"、"正在…"或计划再调用；',
-    '- 标记必须逐字写成 <fn:invoke> 和 </fn:invoke>，不带任何属性、id 或函数名——调用所需的一切都在 JSON 里；',
+    '- 标记必须逐字写成 <fn:invoke> 和 </fn:invoke>：格式A 的起始标记带 name="函数名" 属性，格式B 的起始标记不带任何属性、函数名写在 JSON 里；',
+    '- 格式A 补充规则：参数原文直接写在 <参数名> 和 </参数名> 之间，不需要任何转义；参数原文里不要出现 </fn:invoke> 这串字符（如果可能出现，改用格式B 或把参数拆开）；数值参数也直接写成 <参数名>数字</参数名>；',
     '- 只使用上方列出的函数名；提供全部必填参数，省略未知参数；',
     '- 一次可以连续发多个 <fn:invoke> 块（并行调用）；完全相同的调用不要重复发，除非有操作可能改变了结果；',
     '- 收到 [tool] 结果后先评估任务状态：还有事没做完就发下一个调用，全部完成或需要用户决策时才用普通文本作答；',
@@ -372,6 +388,31 @@ function parseToolCallBody(body) {
   return null
 }
 
+/**
+ * Parse the body of a raw-block call (<fn:invoke name="x"> whose parameters
+ * are top-level <key>value</key> tags instead of JSON). Blocks must be
+ * contiguous (leading whitespace between them is fine; anything else — or
+ * anything after the last block — is trailing junk the caller drops with a
+ * warning). Numbers/booleans are restored to their type when the value
+ * round-trips; everything else stays a string. Returns { args, consumed }
+ * with consumed = offset just past the last matched block.
+ */
+function parseRawBlocks(body) {
+  const re = /^[ \t\r\n]*<([a-zA-Z_][a-zA-Z0-9_-]*)>\s*([\s\S]*?)\s*<\/\1>/
+  const args = {}
+  let consumed = 0
+  for (;;) {
+    const m = body.slice(consumed).match(re)
+    if (!m) break
+    const raw = m[2].trim()
+    if (/^(?:true|false)$/i.test(raw)) args[m[1]] = /^true$/i.test(raw)
+    else if (/^-?\d+(?:\.\d+)?$/.test(raw) && String(Number(raw)) === raw) args[m[1]] = Number(raw)
+    else args[m[1]] = m[2]
+    consumed += m[0].length
+  }
+  return { args, consumed }
+}
+
 export class ToolStreamParser {
   constructor(emit) {
     this.emit = emit
@@ -438,6 +479,96 @@ export class ToolStreamParser {
     return final ? null : { need: true } // object still open, wait for more
   }
 
+  /** Emit one parsed call as a toolCall event (arguments always a JSON string). */
+  emitCall(call) {
+    this.calls++
+    this.emit({
+      toolCall: {
+        index: this.calls - 1,
+        id: 'call-stepx-' + this.calls + '-' + randomUUID().replace(/-/g, '').slice(0, 8),
+        // model is taught m_-prefixed names; map back to the original so
+        // the API client sees the name it declared (tolerates bare names)
+        name: unalias(call.name),
+        arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
+      },
+    })
+    this.pendingClose = true // the close marker may arrive in a later chunk
+  }
+
+  /**
+   * Classify what follows a trigger: 'json' (payload starts with '{'),
+   * 'raw' (payload starts with a parameter tag, i.e. the attribute form
+   * <fn:invoke name="x"><key>…</key>…), null (false trigger) or {need:true}
+   * (undecided yet). Attribute residue like name="x"> between the trigger
+   * and the payload counts as decoration.
+   */
+  payloadKind(from, final) {
+    const windowEnd = Math.min(this.buf.length, from + PAYLOAD_WINDOW)
+    let decor = 0
+    for (let i = from; i < windowEnd; i++) {
+      const c = this.buf[i]
+      if (c === '{') return 'json'
+      if (c === '<') return 'raw'
+      if (c === '}' || c === '[') return null // another block, not a payload
+      if (!/[ \t\r\n`=>"'\/]/.test(c)) {
+        decor++
+        if (decor > 24 || !/[a-zA-Z0-9_:*#\-]/.test(c)) return null // prose or punctuation
+      }
+    }
+    if (final) return null
+    return windowEnd >= this.buf.length ? { need: true } : null
+  }
+
+  /**
+   * Raw-block payload (attribute form): the body runs from the opener's '>'
+   * to the matching </fn:invoke> and holds top-level <key>value</key>
+   * parameters (parseRawBlocks). A JSON body goes through the JSON scan
+   * instead. Waits across chunks until the close tag has arrived.
+   * Returns 'ok' | 'wait' | 'fallback' (fallback = passthrough as text).
+   */
+  processRaw(trig, tEnd, final) {
+    let bodyStart = tEnd
+    if (!trig[0].endsWith('>')) {
+      const gt = this.buf.indexOf('>', tEnd)
+      if (gt === -1 || gt - tEnd > 120) return final ? 'fallback' : 'wait'
+      bodyStart = gt + 1
+    }
+    const body = this.buf.slice(bodyStart)
+    if (!body.trim()) return final ? 'fallback' : 'wait' // payload not started yet
+    const lead = body.match(/^[ \t\r\n`]*([<{])/)
+    if (!lead) return 'fallback' // prose right after the opener: not a raw call
+    if (lead[1] === '{') {
+      // JSON payload behind an attribute-form opener: original JSON path
+      const obj = this.scanObject(bodyStart + lead[0].length - 1, final)
+      if (!obj) return 'fallback'
+      if (obj.need) return 'wait'
+      const call = parseToolCallBody(obj.raw)
+      if (!call) return 'fallback'
+      this.emitCall(call)
+      this.buf = this.buf.slice(obj.end)
+      const closer = this.buf.match(CLOSE_SWALLOW_RE)
+      if (closer) this.buf = this.buf.slice(closer[0].length)
+      return 'ok'
+    }
+    const closeRe = new RegExp('<\\/[ \\t]{0,4}fn' + SEP + '{0,2}invoke[^<>\\[\\{\\n\\`]{0,16}>', 'i')
+    const close = body.match(closeRe)
+    if (!close) {
+      // a following trigger without a close tag means this call never closed
+      if (final || body.length > 65536 || new RegExp(TOOL_TRIGGER_RE.source, 'i').test(body)) return 'fallback'
+      return 'wait'
+    }
+    const nameM = trig[0].match(/name[ \t_:\-]{0,2}=[ \t]{0,2}["']([^"']*)["']/i)
+    if (!nameM || !nameM[1]) return 'fallback' // raw blocks without a name attribute cannot be routed
+    const rawBody = body.slice(0, close.index)
+    const { args, consumed } = parseRawBlocks(rawBody)
+    if (consumed === 0) return 'fallback' // no <key>value</key> block matched
+    const tail = rawBody.slice(consumed)
+    if (tail.trim()) console.warn('[stepx] raw-block call: dropped trailing content after the last parameter block:', tail.trim().slice(0, 80))
+    this.emitCall({ name: nameM[1], arguments: args })
+    this.buf = this.buf.slice(bodyStart + close.index + close[0].length)
+    return 'ok'
+  }
+
   process(final) {
     for (;;) {
       // a close marker that arrives in its own chunk (after the payload was
@@ -445,6 +576,10 @@ export class ToolStreamParser {
       if (this.pendingClose) {
         const head = this.buf.match(CLOSE_HEAD_RE)
         if (head) {
+          // a close head matched without its trailing '>' / ']' — the next
+          // chunk may complete it; hold instead of consuming a half marker
+          // (without this, a '>' split off the close tag leaks as content)
+          if (!final && !head[0].endsWith('>') && /^[ \t\r\n`]*[>\]]?$/.test(this.buf.slice(head[0].length))) return
           this.buf = this.buf.slice(head[0].length)
           // keep expecting: trailing remnant runs (close tag, then DSML-encoded
           // close markers, then more) may span several lines — stay armed while
@@ -460,6 +595,9 @@ export class ToolStreamParser {
           if (!this.buf) return // nothing arrived yet — wait for it
           const stripped = this.buf.toLowerCase().replace(/^[ \t\r\n]+/, '')
           if (stripped.length > 0 && stripped.length <= 24 && CLOSE_TAIL_HEADS.some((h) => h.startsWith(stripped))) return
+          // whitespace-only tail: the close marker may still follow — stay
+          // armed instead of leaking the whitespace as content
+          if (!stripped.length) return
         }
         this.pendingClose = false
       }
@@ -485,6 +623,31 @@ export class ToolStreamParser {
       }
       const tStart = trig.index
       const tEnd = tStart + trig[0].length
+      const kind = this.payloadKind(tEnd, final)
+      if (kind === null) {
+        // false trigger: no payload follows, keep the text and continue after it
+        this.emit({ content: this.buf.slice(0, tEnd) })
+        this.buf = this.buf.slice(tEnd)
+        continue
+      }
+      if (kind.need) {
+        if (!final) return // wait for the payload to finish arriving
+        this.emit({ content: this.buf }) // unterminated: give up, plain text
+        this.buf = ''
+        return
+      }
+      if (kind === 'raw') {
+        const before = this.buf.slice(0, tStart)
+        if (before) this.emit({ content: before })
+        const r = this.processRaw(trig, tEnd, final)
+        if (r === 'wait') return
+        if (r === 'ok') continue
+        // fallback: keep the trigger text and keep scanning after it so
+        // later calls still parse
+        this.emit({ content: this.buf.slice(0, tEnd) })
+        this.buf = this.buf.slice(tEnd)
+        continue
+      }
       const payload = this.findPayload(tEnd, final)
       if (!payload) {
         // false trigger: no JSON follows, keep the text and continue after it
@@ -501,22 +664,8 @@ export class ToolStreamParser {
       const before = this.buf.slice(0, tStart)
       if (before) this.emit({ content: before })
       const call = parseToolCallBody(payload.raw)
-      if (call) {
-        this.calls++
-        this.emit({
-          toolCall: {
-            index: this.calls - 1,
-            id: 'call-stepx-' + this.calls + '-' + randomUUID().replace(/-/g, '').slice(0, 8),
-            // model is taught m_-prefixed names; map back to the original so
-            // the API client sees the name it declared (tolerates bare names)
-            name: unalias(call.name),
-            arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
-          },
-        })
-        this.pendingClose = true // the close marker may arrive in a later chunk
-      } else {
-        this.emit({ content: this.buf.slice(tStart, tEnd) + payload.raw })
-      }
+      if (call) this.emitCall(call)
+      else this.emit({ content: this.buf.slice(tStart, tEnd) + payload.raw })
       // consume trigger + payload, then swallow an optional close marker
       this.buf = this.buf.slice(payload.end)
       const closer = this.buf.match(CLOSE_SWALLOW_RE)
@@ -747,7 +896,7 @@ function httpError(status, message) {
  * Resolves {sessionId, text, thinking} on turn.completed.
  * events is an async iterable of {content}|{reasoning} for streaming.
  */
-function chatTurn({ cookie, projectId, sessionId, text, modelId, signal }) {
+function chatTurn({ cookie, projectId, sessionId, text, invisible, modelId, signal }) {
   let ws
   let settled = false
   let resolveDone, rejectDone
@@ -887,7 +1036,12 @@ function chatTurn({ cookie, projectId, sessionId, text, modelId, signal }) {
             projectId,
             turnId: myTurn,
             ...(sessionId ? { sessionId } : {}),
-            payload: { chatSend: { doc: { blocks: [{ text }] }, ...(modelId && modelId !== 'auto' ? { model: modelId } : {}) } },
+            payload: { chatSend: { doc: { blocks: [
+              // v0.3: preamble/reminder/tool protocol ride in an invisibleText
+              // ref block ahead of the visible text (server-verified support)
+              ...(invisible ? [{ ref: { kind: 'invisibleText', text: invisible } }] : []),
+              { text },
+            ] }, ...(modelId && modelId !== 'auto' ? { model: modelId } : {}) } },
             userLocale: USER_LOCALE,
           }),
         )
@@ -1088,7 +1242,7 @@ export const StepXAuthPlugin = async (_input, options) => {
                 let toolBlock = ''
                 if (tools.length || payload.tool_choice === 'none') {
                   if (st.lastFull === '' || st.toolsKey !== tKey) {
-                    toolBlock = (st.lastFull === '' ? '' : '【工具列表更新】\n') + toolPreamble(tools, payload.tool_choice) + '\n\n---\n\n'
+                    toolBlock = (st.lastFull === '' ? '' : '【工具列表更新】\n') + toolPreamble(tools, payload.tool_choice)
                   }
                 }
                 const sendText = composeTurnText({
@@ -1098,12 +1252,13 @@ export const StepXAuthPlugin = async (_input, options) => {
                   toolsPresent: tools.length > 0,
                   deltaText: st.lastFull === '' ? flat : deltaContinuation(st.lastFull, flat),
                 })
-                const oneTurn = async function* (text) {
+                const oneTurn = async function* ({ text, invisible }) {
                   const turn = chatTurn({
                     cookie,
                     projectId: st.projectId,
                     sessionId: st.sessionId ?? undefined,
                     text,
+                    invisible,
                     modelId: askedModel,
                     signal: init?.signal,
                   })
@@ -1149,7 +1304,7 @@ export const StepXAuthPlugin = async (_input, options) => {
                 let { result, hadOutput } = yield* oneTurn(sendText)
                 if (!hadOutput) {
                   // 模型偶发整轮空回复：同会话补问一轮
-                  const retry = yield* oneTurn('（你上一条回复为空，请完整地重新回答上一条消息。）')
+                  const retry = yield* oneTurn({ text: '（你上一条回复为空，请完整地重新回答上一条消息。）' })
                   result = retry.result
                 }
                 if (result.ctxFull) st.exhausted = true // next request on this conversation starts a fresh project
@@ -1206,15 +1361,24 @@ function deltaContinuation(lastFull, flat) {
 }
 
 /**
- * Compose the upstream text for one turn (pure, testable). First turn:
- * [PREAMBLE] + toolBlock + full flat. Continuations: toolBlock (only on
- * toolset change) + [REMINDER] + one-line TOOL_RECENCY (when tools are
- * still declared — not gated on persona) + delta. `flat` itself is never
- * modified, so lastFull prefix-matching stays byte-stable.
+ * Compose the upstream payload for one turn (pure, testable). v0.3: the
+ * persona preamble/reminder and the tool protocol ride in an invisibleText
+ * ref block ahead of the visible text, so `text` stays the pure conversation
+ * transcript the preamble wording refers to. First turn:
+ * invisible = [PREAMBLE, toolBlock] ('---'-separated), text = full flat.
+ * Continuations: invisible = [toolBlock (only on toolset change), REMINDER,
+ * TOOL_RECENCY (when tools are still declared — not gated on persona)],
+ * text = delta. `flat` itself is never modified, so lastFull prefix-matching
+ * stays byte-stable.
  */
 function composeTurnText({ firstTurn, persona, toolBlock, toolsPresent, deltaText }) {
-  if (firstTurn) return (persona ? PREAMBLE + '\n\n---\n\n' : '') + toolBlock + deltaText
-  return toolBlock + (persona ? REMINDER + '\n\n' : '') + (toolsPresent ? TOOL_RECENCY + '\n\n' : '') + deltaText
+  const invisible =
+    (
+      firstTurn
+        ? [persona ? PREAMBLE : '', toolBlock].filter(Boolean).join('\n\n---\n\n')
+        : [toolBlock, persona ? REMINDER : '', toolsPresent ? TOOL_RECENCY : ''].filter(Boolean).join('\n\n')
+    ) || undefined
+  return { text: deltaText, invisible }
 }
 
 function errorResponse(e) {
@@ -1365,6 +1529,7 @@ export const _internal = {
   unalias,
   toolPreamble,
   parseToolCallBody,
+  parseRawBlocks,
   ToolStreamParser,
 }
 
