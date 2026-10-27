@@ -1,0 +1,4 @@
+node_modules/
+*.zip
+debug-*.jsonl
+cookies.txt

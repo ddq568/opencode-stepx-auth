@@ -1,0 +1,38 @@
+{
+  "name": "opencode-stepx-auth",
+  "version": "0.2.5",
+  "description": "OpenCode provider plugin: Step Studio (studio.stepx.com) chat models — Step 5 Preview / DeepSeek V4.1 Flash / Auto, with tool-call emulation, via the web session",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "README.md",
+    "LICENSE",
+    "icon.png"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "magpie",
+    "magpie-plugin",
+    "stepx",
+    "stepfun",
+    "step-5"
+  ],
+  "author": "ddq568",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ddq568/opencode-stepx-auth.git"
+  },
+  "homepage": "https://github.com/ddq568/opencode-stepx-auth#readme",
+  "bugs": "https://github.com/ddq568/opencode-stepx-auth/issues",
+  "license": "MIT",
+  "magpie": {
+    "maxConcurrency": 4,
+    "icon": "data:image/png;base64,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"
+  },
+  "scripts": {
+    "test": "node --test index.test.mjs"
+  }
+}
