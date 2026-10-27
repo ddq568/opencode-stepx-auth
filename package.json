@@ -1,6 +1,6 @@
 {
   "name": "opencode-stepx-auth",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "OpenCode provider plugin: Step Studio (studio.stepx.com) chat models — Step 5 Preview / DeepSeek V4.1 Flash / Auto, with tool-call emulation, via the web session",
   "type": "module",
   "main": "./index.mjs",

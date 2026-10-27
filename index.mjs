@@ -185,6 +185,14 @@ function conversationKey(flat, modelId) {
 // swallowed, never required.
 const TOOL_OPEN_TAG = '<fn:invoke>'
 const TOOL_CLOSE_TAG = '</fn:invoke>'
+// Strict close-marker matcher: unlike CLOSE_SWALLOW_RE (which also matches an
+// opening tag), this only ever matches a *closing* marker at the head of the
+// buffer. Used to swallow a close tag that arrives in its own streaming chunk
+// AFTER the payload of its call was already consumed by an earlier chunk —
+// without this, `\n</fn:invoke>` leaks into content as stray text.
+const CLOSE_HEAD_RE =
+  /^[ \t\r\n]{0,8}(?:<\/[ \t]{0,4}(?:fn[ \t_:\-]{0,2}invoke|tool[ \t_:\-]{0,2}calls?)[^<>\[\{\n]{0,16}>?|\[?[ \t]{0,4}(?:end[ _\-]{1,2}|\/)[ \t]{0,4}(?:fn[ \t_:\-]{0,2}invoke|tool[ \t_:\-]{0,2}calls?)[ \t]{0,4}\]?)/i
+const CLOSE_TAIL_HEADS = ['</fn invoke', '</fn_invoke', '</fn:invoke', '</tool_call', '[/fn invoke]', '[/fn:invoke]', '[/tool_call]', '[end fn invoke]', '[end tool_call]', '[end fn_invoke]', '[end tool_calls]']
 // --- tool-call markers (fuzzy trigger + payload-window recovery) -----------
 // Canonical taught form is <fn:invoke>…</fn:invoke> (survives the studio's
 // backend, which intercepts the platform-native <tool_call>). The parser is
@@ -230,6 +238,8 @@ function toolPreamble(tools, toolChoice) {
     '- 只使用上方列出的函数名；提供全部必填参数，省略未知参数；',
     '- 一次可以连续发多个 <fn:invoke> 块（并行调用）；完全相同的调用不要重复发，除非有操作可能改变了结果；',
     '- 收到 [tool] 结果后先评估任务状态：还有事没做完就发下一个调用，全部完成或需要用户决策时才用普通文本作答；',
+    '- 严禁虚构工具执行：在收到对应的 [tool] 消息之前，一律视为工具尚未执行——不得声称"已实测/已执行/已验证"，不得编造工具回执、临时文件路径、报错文本（如"No such tool"）或任何结果数据；',
+    '- 被问"你能不能调用某工具"时，唯一可信的回答方式是当场发出真实的 <fn:invoke> 调用；若不调用，就如实说明原因，绝不虚构测试结论；',
     '- 没有工具结果佐证，不要声称文件已改、命令已成功、结果已验证；',
     '- 不需要工具时直接用文本回答，不要输出 <fn:invoke>；',
     '- 调用结果会在下一轮以 [tool] 消息返回。',
@@ -240,7 +250,7 @@ function toolPreamble(tools, toolChoice) {
   else if (toolChoice === 'none') lines.push('- 本次禁止调用任何工具，直接文本回答。')
   const toolNames = tools.map((t) => functionOf(t)?.name).filter(Boolean)
   const intro = toolNames.length
-    ? '我是运行在你本地终端里的编程助手。本轮可用工具：' + toolNames.join('、') + '（' + (toolNames.length <= 3 ? '读写本机文件/执行本机命令类' : '本机文件与命令类') + '）。我能：读写你电脑上的文件、在你电脑上执行命令、排查修复代码问题、写脚本和测试、以及编程知识答疑。本会话无法创建应用、无法访问云端。'
+    ? '我是运行在你本地终端里的编程助手。本轮可尝试调用的工具：' + toolNames.join('、') + '（' + (toolNames.length <= 3 ? '读写本机文件/执行本机命令类' : '本机文件与命令类') + '）。我可以尝试调用这些工具来完成读写文件、执行命令、排查修复代码问题、写脚本和测试；任何操作只有在我实际发出调用并收到 [tool] 结果之后才算完成。此外还能做编程知识答疑与方案设计。本会话无法创建应用、无法访问云端。'
     : '我是运行在你本地终端里的编程助手，本轮为纯问答模式（无工具）。我能：编程知识答疑、方案设计、代码解读与编写建议。本会话无法创建应用、无法访问云端。'
   lines.push('', '【标准自我介绍】当用户问你能做什么/有什么技能/介绍一下自己时，直接采用下面这段话作答（可按实际情况微调措辞，但不得添加其他能力）：', intro)
   return lines.join('\n')
@@ -256,6 +266,28 @@ function toolsHashKey(tools, toolChoice) {
     .digest('hex')
 }
 
+/** Escape raw control chars that models emit inside JSON string literals. */
+function repairJson(s) {
+  let out = ''
+  let inStr = false
+  let esc = false
+  for (const c of s) {
+    if (inStr) {
+      if (esc) { esc = false; out += c; continue }
+      if (c === '\\') { esc = true; out += c; continue }
+      if (c === '"') { inStr = false; out += c; continue }
+      if (c === '\n') { out += '\\n'; continue }
+      if (c === '\r') { out += '\\r'; continue }
+      if (c === '\t') { out += '\\t'; continue }
+      out += c
+      continue
+    }
+    if (c === '"') inStr = true
+    out += c
+  }
+  return out
+}
+
 /** Extract one JSON object from a <fn:invoke> body, tolerating code fences. */
 function parseToolCallBody(body) {
   let s = body.trim()
@@ -263,18 +295,22 @@ function parseToolCallBody(body) {
   if (fence) s = fence[1].trim()
   // the model may emit multiple objects; take the first valid one
   for (const candidate of [s, s.split('\n')[0]]) {
-    try {
-      const j = JSON.parse(candidate)
-      if (j && typeof j.name === 'string') return j
-    } catch {}
+    for (const text of [candidate, repairJson(candidate)]) {
+      try {
+        const j = JSON.parse(text)
+        if (j && typeof j.name === 'string') return j
+      } catch {}
+    }
   }
   // last resort: first {...} span
   const m = s.match(/\{[\s\S]*\}/)
   if (m) {
-    try {
-      const j = JSON.parse(m[0])
-      if (j && typeof j.name === 'string') return j
-    } catch {}
+    for (const text of [m[0], repairJson(m[0])]) {
+      try {
+        const j = JSON.parse(text)
+        if (j && typeof j.name === 'string') return j
+      } catch {}
+    }
   }
   return null
 }
@@ -284,6 +320,7 @@ export class ToolStreamParser {
     this.emit = emit
     this.buf = ''
     this.calls = 0
+    this.pendingClose = false // a toolCall was emitted; its close marker may still arrive
   }
 
   push(chunk) {
@@ -346,6 +383,25 @@ export class ToolStreamParser {
 
   process(final) {
     for (;;) {
+      // a close marker that arrives in its own chunk (after the payload was
+      // consumed by an earlier chunk) must still be swallowed, not leaked
+      if (this.pendingClose) {
+        const head = this.buf.match(CLOSE_HEAD_RE)
+        if (head) {
+          this.buf = this.buf.slice(head[0].length)
+          this.pendingClose = false
+          if (!this.buf) return
+          continue
+        }
+        // close marker may still be split across chunks: hold back a
+        // prefix-shaped head instead of clearing the expectation
+        if (!final) {
+          if (!this.buf) return // nothing arrived yet — wait for it
+          const stripped = this.buf.toLowerCase().replace(/^[ \t\r\n]+/, '')
+          if (stripped.length > 0 && stripped.length <= 24 && CLOSE_TAIL_HEADS.some((h) => h.startsWith(stripped))) return
+        }
+        this.pendingClose = false
+      }
       const trig = this.buf.match(TOOL_TRIGGER_RE)
       if (!trig) {
         // hold back a tail that could still become a trigger
@@ -394,13 +450,14 @@ export class ToolStreamParser {
             arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
           },
         })
+        this.pendingClose = true // the close marker may arrive in a later chunk
       } else {
         this.emit({ content: this.buf.slice(tStart, tEnd) + payload.raw })
       }
       // consume trigger + payload, then swallow an optional close marker
       this.buf = this.buf.slice(payload.end)
       const closer = this.buf.match(CLOSE_SWALLOW_RE)
-      if (closer) this.buf = this.buf.slice(closer[0].length)
+      if (closer) { this.buf = this.buf.slice(closer[0].length); this.pendingClose = false }
     }
   }
 }
