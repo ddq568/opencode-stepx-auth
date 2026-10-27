@@ -305,7 +305,8 @@ function toolPreamble(tools, toolChoice) {
     '{"name": "函数名", "arguments": {参数对象}}',
     '</fn:invoke>',
     '- 工具调用块必须是你回复的第一个非空白内容：不要先写"我来…"、"让我…"、"正在…"或计划再调用；',
-    '- 标记必须逐字写成 <fn:invoke> 和 </fn:invoke>：格式A 的起始标记带 name="函数名" 属性，格式B 的起始标记不带任何属性、函数名写在 JSON 里；',
+    '- 标记必须逐字写成 <fn:invoke> 和 </fn:invoke>：格式A 的起始标记【必须】带 name="函数名" 属性，禁止省略 name；不带 name 的 <fn:invoke> 开头只用于格式B（JSON）；',
+    '- 反例（错误格式，禁止）：混写——<fn:invoke> 开头不带 name 却用 <参数名>值</参数名> 块；要么带 name 属性+参数块（格式A），要么不带 name+JSON（格式B），二者必须配套；',
     '- 格式A 补充规则：参数原文直接写在 <参数名> 和 </参数名> 之间，不需要任何转义；参数原文里不要出现 </fn:invoke> 这串字符（如果可能出现，改用格式B 或把参数拆开）；数值参数也直接写成 <参数名>数字</参数名>；',
     '- 只使用上方列出的函数名；提供全部必填参数，省略未知参数；',
     '- 一次可以连续发多个 <fn:invoke> 块（并行调用）；完全相同的调用不要重复发，除非有操作可能改变了结果；',
@@ -414,8 +415,16 @@ function parseRawBlocks(body) {
 }
 
 export class ToolStreamParser {
-  constructor(emit) {
+  /**
+   * @param emit sink for content/toolCall events
+   * @param toolKeys optional { [aliasedToolName]: [declaredParameterNames] };
+   * lets the parser route nameless raw-block calls (<fn:invoke> with no
+   * name= attribute but <key>…</key> parameter blocks) by matching the
+   * body's parameter-key set against the declared toolset.
+   */
+  constructor(emit, toolKeys) {
     this.emit = emit
+    this.toolKeys = toolKeys ?? null
     this.buf = ''
     this.calls = 0
     this.pendingClose = false // a toolCall was emitted; its close marker may still arrive
@@ -482,7 +491,7 @@ export class ToolStreamParser {
   /** Emit one parsed call as a toolCall event (arguments always a JSON string). */
   emitCall(call) {
     this.calls++
-    this.emit({
+    const ev = {
       toolCall: {
         index: this.calls - 1,
         id: 'call-stepx-' + this.calls + '-' + randomUUID().replace(/-/g, '').slice(0, 8),
@@ -491,7 +500,9 @@ export class ToolStreamParser {
         name: unalias(call.name),
         arguments: typeof call.arguments === 'string' ? call.arguments : JSON.stringify(call.arguments ?? {}),
       },
-    })
+    }
+    if (call.note) ev.toolCall.note = call.note // name was inferred, not declared on the opener
+    this.emit(ev)
     this.pendingClose = true // the close marker may arrive in a later chunk
   }
 
@@ -517,6 +528,37 @@ export class ToolStreamParser {
     }
     if (final) return null
     return windowEnd >= this.buf.length ? { need: true } : null
+  }
+
+  /**
+   * Infer the tool for a nameless raw-block call from its body's parameter
+   * keys. Order: exact key-set match against toolKeys, then a declared
+   * superset (most overlap / fewest unused declared params), then a bash
+   * fallback when the keys name a command/cmd parameter. Returns
+   * { name, note } (note marks the name as inferred) or null when nothing
+   * justifies a toolCall (caller falls back to passthrough).
+   */
+  inferToolName(keys) {
+    const keySet = new Set(keys)
+    if (this.toolKeys) {
+      for (const [name, params] of Object.entries(this.toolKeys)) {
+        if (params.length === keys.length && params.every((p) => keySet.has(p)))
+          return { name, note: 'name inferred from parameter keys (opener lacked name=)' }
+      }
+      let best = null
+      for (const [name, params] of Object.entries(this.toolKeys)) {
+        if (!keys.every((k) => params.includes(k))) continue // declared params must be a superset of the body keys
+        const overlap = keys.filter((k) => params.includes(k)).length
+        const extra = params.length - keys.length
+        if (!best || overlap > best.overlap || (overlap === best.overlap && extra < best.extra))
+          best = { name, overlap, extra }
+      }
+      if (best)
+        return { name: best.name, note: 'name inferred from parameter keys (opener lacked name=)' }
+    }
+    if (keys.some((k) => k === 'command' || k === 'cmd'))
+      return { name: 'bash', note: 'name inferred: bash fallback (opener lacked name=, body keys contain command/cmd)' }
+    return null
   }
 
   /**
@@ -558,13 +600,23 @@ export class ToolStreamParser {
       return 'wait'
     }
     const nameM = trig[0].match(/name[ \t_:\-]{0,2}=[ \t]{0,2}["']([^"']*)["']/i)
-    if (!nameM || !nameM[1]) return 'fallback' // raw blocks without a name attribute cannot be routed
     const rawBody = body.slice(0, close.index)
     const { args, consumed } = parseRawBlocks(rawBody)
     if (consumed === 0) return 'fallback' // no <key>value</key> block matched
-    const tail = rawBody.slice(consumed)
-    if (tail.trim()) console.warn('[stepx] raw-block call: dropped trailing content after the last parameter block:', tail.trim().slice(0, 80))
-    this.emitCall({ name: nameM[1], arguments: args })
+    if (!nameM || !nameM[1]) {
+      // nameless opener + <key> blocks: the exact mixed-up format the model
+      // sometimes emits (taught form A always carries name=). Route by the
+      // parameter-key set instead of leaking the whole block as text.
+      const inferred = this.inferToolName(Object.keys(args))
+      if (!inferred) return 'fallback' // unroutable: leak as text (unchanged behavior)
+      const tail0 = rawBody.slice(consumed)
+      if (tail0.trim()) console.warn('[stepx] raw-block call: dropped trailing content after the last parameter block:', tail0.trim().slice(0, 80))
+      this.emitCall({ name: inferred.name, arguments: args, note: inferred.note })
+    } else {
+      const tail = rawBody.slice(consumed)
+      if (tail.trim()) console.warn('[stepx] raw-block call: dropped trailing content after the last parameter block:', tail.trim().slice(0, 80))
+      this.emitCall({ name: nameM[1], arguments: args })
+    }
     this.buf = this.buf.slice(bodyStart + close.index + close[0].length)
     return 'ok'
   }
@@ -1276,7 +1328,12 @@ export const StepXAuthPlugin = async (_input, options) => {
                     wake = null
                   }
                   const pump = (async () => {
-                    const parser = new ToolStreamParser(put)
+                    // parameter-name map for routing nameless raw-block calls
+                    // (mixed-up format): { [aliasedName]: [declaredParamNames] }
+                    const toolKeys = tools.length
+                      ? Object.fromEntries(tools.map((t) => [alias(functionOf(t).name), Object.keys(functionOf(t).parameters?.properties || {})]))
+                      : undefined
+                    const parser = new ToolStreamParser(put, toolKeys)
                     try {
                       for await (const ev of turn.events) {
                         if (ev.content !== undefined) parser.push(ev.content)

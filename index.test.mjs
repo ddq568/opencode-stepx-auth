@@ -377,3 +377,72 @@ test('ToolStreamParser: raw-block 内容含孤立 </fn:invoke> 字样时不误�
     assert.ok(out.some((e) => e.content?.includes('<fn:invoke')), '无法路由时应回退透传原文')
   }
 })
+
+// ---------------- v0.3.2 混搭格式（无 name 开头 + raw 参数块）不再泄漏 ----------------
+
+const MIXED_BLOCK = '<fn:invoke>\n<command>cd ~ && python3 check_circle_now.png</command>\n</fn:invoke>'
+
+test('ToolStreamParser: 混搭格式（无 name + <command> 块）经 toolKeys 超集匹配路由为 m_bash', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e), { m_bash: ['command', 'timeout'] })
+  p.push(MIXED_BLOCK)
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call, '不应按正文泄漏，应产出 toolCall')
+  assert.equal(call.name, 'bash', 'm_bash 应还原为 bash')
+  assert.equal(JSON.parse(call.arguments).command, 'cd ~ && python3 check_circle_now.png')
+  assert.ok(call.note, '推断的调用应带 note 标记')
+  assert.ok(!out.some((e) => e.content?.includes('<fn:invoke>')), '标记不应泄漏到正文')
+})
+
+test('ToolStreamParser: 混搭格式 key 集合完全相等时精确匹配 toolKeys', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e), { m_write: ['path', 'content'], m_bash: ['command', 'timeout'] })
+  p.push('<fn:invoke><path>/tmp/a.txt</path><content>hello</content></fn:invoke>')
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call)
+  assert.equal(call.name, 'write', '两个工具都可作超集时应选重叠最大者')
+  assert.deepEqual(JSON.parse(call.arguments), { path: '/tmp/a.txt', content: 'hello' })
+  assert.ok(call.note)
+})
+
+test('ToolStreamParser: 混搭格式无 toolKeys 时 bash fallback（command/cmd）', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e))
+  p.push(MIXED_BLOCK)
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call, '无 toolKeys 也应产出 fallback 名 toolCall')
+  assert.equal(call.name, 'bash')
+  assert.ok(call.note)
+})
+
+test('ToolStreamParser: 混搭格式无法路由（无 toolKeys、无 command/cmd）仍按现状透传', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e))
+  const block = '<fn:invoke><path>/tmp/a.txt</path></fn:invoke>'
+  p.push(block)
+  p.end()
+  assert.ok(!out.some((e) => e.toolCall))
+  assert.equal(out.filter((e) => e.content !== undefined).map((e) => e.content).join(''), block, '原文透传')
+})
+
+test('ToolStreamParser: 混搭格式跨 chunk 分片同样解析', () => {
+  const out = []
+  const p = new ToolStreamParser((e) => out.push(e), { m_bash: ['command', 'timeout'] })
+  for (let i = 0; i < MIXED_BLOCK.length; i += 5) p.push(MIXED_BLOCK.slice(i, i + 5))
+  p.end()
+  const call = out.find((e) => e.toolCall)?.toolCall
+  assert.ok(call)
+  assert.equal(call.name, 'bash')
+  assert.equal(JSON.parse(call.arguments).command, 'cd ~ && python3 check_circle_now.png')
+  assert.ok(!out.some((e) => e.content?.includes('<fn:invoke>')))
+})
+
+test('toolPreamble: 格式A 必须带 name 属性 + 混搭反例提示', () => {
+  const p = toolPreamble(TOOLS, undefined)
+  assert.ok(p.includes('【必须】带 name="函数名" 属性'), '格式A 应强制 name 属性')
+  assert.ok(p.includes('混写'), '应包含混搭反例提示')
+  assert.ok(p.includes('m_ 前缀提供'), 'm_ 别名机制不变')
+})
