@@ -1,6 +1,6 @@
 {
   "name": "opencode-stepx-auth",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "OpenCode provider plugin: Step Studio (studio.stepx.com) chat models — Step 5 Preview / DeepSeek V4.1 Flash / Auto, with tool-call emulation, via the web session",
   "type": "module",
   "main": "./index.mjs",
@@ -15,18 +15,10 @@
     "opencode",
     "opencode-plugin",
     "magpie",
-    "magpie-plugin",
     "stepx",
     "stepfun",
     "step-5"
   ],
-  "author": "ddq568",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ddq568/opencode-stepx-auth.git"
-  },
-  "homepage": "https://github.com/ddq568/opencode-stepx-auth#readme",
-  "bugs": "https://github.com/ddq568/opencode-stepx-auth/issues",
   "license": "MIT",
   "magpie": {
     "maxConcurrency": 4,

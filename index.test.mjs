@@ -4,7 +4,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 const m = await import('./index.mjs')
-const { flattenMessages, conversationKey, deltaContinuation, FALLBACK_MODELS, PREAMBLE } = m._internal
+const { flattenMessages, conversationKey, deltaContinuation, FALLBACK_MODELS, PREAMBLE, REMINDER, TOOL_RECENCY } = m._internal
+const { alias, unalias, toolPreamble, ToolStreamParser, composeTurnText } = m._internal
 
 // ---------------------------------------------------------------- flattenMessages
 
@@ -151,4 +152,155 @@ test('FALLBACK_MODELS: 包含 auto、step-5-preview、deepseek-flash[1m]，各�
 test('PREAMBLE: 是非空字符串', () => {
   assert.equal(typeof PREAMBLE, 'string')
   assert.ok(PREAMBLE.length > 0)
+})
+
+// ---------------------------------------------------------------- v0.2.7 alias / unalias
+
+test('alias/unalias: 前缀映射与容错还原', () => {
+  assert.equal(alias('read'), 'm_read')
+  assert.equal(alias('bash'), 'm_bash')
+  assert.equal(alias('skill_manage'), 'm_skill_manage')
+  assert.equal(unalias('m_read'), 'read')
+  assert.equal(unalias('read'), 'read') // 容错：模型发明文名（历史里是原始名）原样通过
+  assert.equal(unalias('m_skill_manage'), 'skill_manage')
+  assert.equal(unalias(''), '')
+})
+
+test('unalias: 只剥一层 m_ 前缀', () => {
+  assert.equal(unalias('m_m_foo'), 'm_foo')
+  assert.equal(unalias('mm_foo'), 'mm_foo')
+})
+
+// ---------------------------------------------------------------- v0.2.7 ToolStreamParser 别名还原
+
+function parseToolCalls(text) {
+  const events = []
+  const p = new ToolStreamParser((ev) => events.push(ev))
+  p.push(text)
+  p.end()
+  return events.filter((e) => e.toolCall).map((e) => e.toolCall)
+}
+
+test('ToolStreamParser: 模型发 m_read 前缀名 → 还原为 read', () => {
+  const calls = parseToolCalls('<fn:invoke>\n{"name": "m_read", "arguments": {"path": "a.txt"}}\n</fn:invoke>')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'read')
+  assert.equal(calls[0].arguments, '{"path":"a.txt"}')
+})
+
+test('ToolStreamParser: 模型发明文 read（历史里是原始名）→ 仍为 read', () => {
+  const calls = parseToolCalls('<fn:invoke>\n{"name": "read", "arguments": {"path": "a.txt"}}\n</fn:invoke>')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'read')
+})
+
+test('ToolStreamParser: 未声明过的 m_ 前缀名也一律剥前缀（始终归一化）', () => {
+  const calls = parseToolCalls('<fn:invoke>\n{"name": "m_delete_everything", "arguments": {}}\n</fn:invoke>')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'delete_everything')
+})
+
+test('ToolStreamParser: 流式分片到达的 m_ 前缀调用同样还原，标记不泄漏', () => {
+  const events = []
+  const p = new ToolStreamParser((ev) => events.push(ev))
+  p.push('前言 <fn:invoke>\n{"name": "m_b')
+  p.push('ash", "arguments": {"command": "ls"}}\n</fn')
+  p.push(':invoke> 后记')
+  p.end()
+  const calls = events.filter((e) => e.toolCall).map((e) => e.toolCall)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, 'bash')
+  assert.equal(calls[0].arguments, '{"command":"ls"}')
+  const text = events.filter((e) => e.content).map((e) => e.content).join('')
+  assert.ok(text.includes('前言'), `应保留正文: ${JSON.stringify(text)}`)
+  assert.ok(!text.includes('fn:invoke'), `标记不应泄漏: ${JSON.stringify(text)}`)
+})
+
+// ---------------------------------------------------------------- v0.2.7 toolPreamble
+
+const TOOLS = [
+  { type: 'function', function: { name: 'bash', description: 'run a command', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } } },
+  { type: 'function', function: { name: 'read', description: 'read a file', parameters: { type: 'object', properties: { path: { type: 'string' } } } } },
+]
+
+test('toolPreamble: 工具名以 m_ 前缀呈现，含成功前例，不含 "No such tool"', () => {
+  const p = toolPreamble(TOOLS, undefined)
+  assert.ok(p.includes('m_read'))
+  assert.ok(p.includes('"m_bash"'), '工具 Schema 的 name 应为 m_bash')
+  assert.ok(!p.includes('"name": "bash"'))
+  assert.ok(!p.includes('"name":"bash"'))
+  assert.ok(p.includes('m_ 前缀提供'), '应解释 m_ 前缀含义')
+  assert.ok(p.includes('与宿主环境的其他工具系统无关'), '应声明与宿主工具通道无关')
+  // 成功前例
+  assert.ok(p.includes('（示例——上一轮你成功调用过工具）'))
+  assert.ok(p.includes('<fn:invoke>'))
+  assert.ok(p.includes('"m_bash"'))
+  assert.ok(p.includes('调用已经在此会话中正常工作过'))
+  // 反幻觉：不得出现示例报错文案
+  assert.ok(!p.includes('No such tool'), '不得枚举示例错误字符串')
+})
+
+test('toolPreamble: 无 bash 时前例退回到第一个工具的别名', () => {
+  const p = toolPreamble([{ type: 'function', function: { name: 'read', parameters: { type: 'object' } } }], undefined)
+  assert.ok(p.includes('"m_read"'))
+  assert.ok(p.includes('（示例——上一轮你成功调用过工具）'))
+  assert.ok(p.includes('<fn:invoke>'))
+  assert.ok(p.includes('调用已经在此会话中正常工作过'))
+})
+
+test('toolPreamble: tool_choice 指定函数名时也以别名呈现', () => {
+  const p = toolPreamble(TOOLS, { type: 'function', function: { name: 'read' } })
+  assert.ok(p.includes('本次必须调用函数 m_read'))
+})
+
+test('toolPreamble: tool_choice=none 且无工具时不注入前例与 m_ 说明', () => {
+  const p = toolPreamble([], 'none')
+  assert.ok(!p.includes('（示例——上一轮你成功调用过工具）'))
+  assert.ok(!p.includes('m_ 前缀提供'))
+  assert.ok(p.includes('禁止调用任何工具'))
+})
+
+// ---------------------------------------------------------------- v0.2.7 composeTurnText
+
+test('composeTurnText: 首轮带工具时包含前例（经 toolPreamble），不带逐轮提醒', () => {
+  const toolBlock = toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
+  const text = composeTurnText({ firstTurn: true, persona: true, toolBlock, toolsPresent: true, deltaText: '[user]\n问题' })
+  assert.ok(text.includes('（示例——上一轮你成功调用过工具）'), '首轮应包含成功前例')
+  assert.ok(text.includes(PREAMBLE.slice(0, 20)), 'persona 开启时首轮应有 PREAMBLE')
+  assert.ok(!text.includes(TOOL_RECENCY), '首轮不应带逐轮提醒')
+  assert.ok(text.endsWith('[user]\n问题'))
+})
+
+test('composeTurnText: 首轮 persona:false 无 PREAMBLE 但仍带工具前例', () => {
+  const toolBlock = toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
+  const text = composeTurnText({ firstTurn: true, persona: false, toolBlock, toolsPresent: true, deltaText: 'flat' })
+  assert.ok(!text.includes(PREAMBLE.slice(0, 20)))
+  assert.ok(text.includes('（示例——上一轮你成功调用过工具）'))
+})
+
+test('composeTurnText: 续轮且有工具时带一行格式提醒（persona:false 也生效）', () => {
+  const text = composeTurnText({ firstTurn: false, persona: false, toolBlock: '', toolsPresent: true, deltaText: '[tool:read]\n结果' })
+  assert.ok(text.includes(TOOL_RECENCY), '续轮应带格式提醒且不受 persona 开关影响')
+  assert.ok(!text.includes(REMINDER))
+  assert.ok(text.endsWith('[tool:read]\n结果'))
+})
+
+test('composeTurnText: 续轮无工具时不带格式提醒；有 persona 时带 REMINDER', () => {
+  const withPersona = composeTurnText({ firstTurn: false, persona: true, toolBlock: '', toolsPresent: false, deltaText: '续问' })
+  assert.ok(!withPersona.includes(TOOL_RECENCY))
+  assert.ok(withPersona.includes(REMINDER))
+  const noPersona = composeTurnText({ firstTurn: false, persona: false, toolBlock: '', toolsPresent: false, deltaText: '续问' })
+  assert.ok(!noPersona.includes(TOOL_RECENCY))
+  assert.ok(!noPersona.includes(REMINDER))
+})
+
+test('composeTurnText: 续轮且工具集更新时 toolBlock 在最前，提醒与增量按序拼接', () => {
+  const toolBlock = '【工具列表更新】\n' + toolPreamble(TOOLS, undefined) + '\n\n---\n\n'
+  const text = composeTurnText({ firstTurn: false, persona: true, toolBlock, toolsPresent: true, deltaText: '增量' })
+  assert.ok(text.startsWith('【工具列表更新】'))
+  const iBlock = text.indexOf('---\n\n')
+  const iRem = text.indexOf(REMINDER)
+  const iRec = text.indexOf(TOOL_RECENCY)
+  const iDelta = text.indexOf('增量')
+  assert.ok(iBlock >= 0 && iRem > iBlock && iRec > iRem && iDelta > iRec, '顺序应为 toolBlock → REMINDER → 提醒 → 增量')
 })
