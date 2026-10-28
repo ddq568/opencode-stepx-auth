@@ -4,7 +4,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
 const m = await import('./index.mjs')
-const { flattenMessages, conversationKey, deltaContinuation, FALLBACK_MODELS, PREAMBLE, REMINDER, TOOL_RECENCY } = m._internal
+const { flattenMessages, conversationKey, deltaContinuation, FALLBACK_MODELS, PREAMBLE, REMINDER, TOOL_RECENCY, TOOL_RESULT_HEAD, TOOL_RESULT_TAIL } = m._internal
 const { alias, unalias, toolPreamble, ToolStreamParser, composeTurnText, parseRawBlocks } = m._internal
 
 // ---------------------------------------------------------------- flattenMessages
@@ -63,6 +63,53 @@ test('flattenMessages: 空消息数组、null/undefined、空内容均安全返�
     ]),
     '',
   )
+})
+
+test('flattenMessages: 64KB tool 内容不截断（低于 HEAD+TAIL+2048 门槛）', () => {
+  const body = 'x'.repeat(64 * 1024)
+  const flat = flattenMessages([{ role: 'tool', content: body }])
+  assert.ok(flat.startsWith('[tool]\n' + body), '64KB < 门槛，内容应原样保留')
+  assert.ok(!flat.includes('截断'), '不应出现截断标记')
+  assert.equal(flat.length, '[tool]\n'.length + body.length)
+})
+
+test('flattenMessages: 超长 tool 内容头尾截断，标记含正确的省略字符数', () => {
+  const len = TOOL_RESULT_HEAD + TOOL_RESULT_TAIL + 5000
+  const chars = Array.from({ length: len }, (_, i) => String.fromCharCode(97 + (i % 26)))
+  // 唯一哨兵写在严格中段，验证截断确实把它移除了（循环模式无法区分中段/头部）
+  const sentinel = '【中段哨兵】'.repeat(20)
+  for (let i = 0; i < sentinel.length; i++) chars[TOOL_RESULT_HEAD + 10 + i] = sentinel[i]
+  const body = chars.join('')
+  const flat = flattenMessages([{ role: 'tool', content: body }])
+  assert.ok(flat.startsWith('[tool]\n'), '[tool] 标记本身必须完整')
+  assert.ok(flat.startsWith('[tool]\n' + body.slice(0, TOOL_RESULT_HEAD)), '头部内容原样保留')
+  assert.ok(flat.endsWith(body.slice(-TOOL_RESULT_TAIL)), '尾部内容原样保留')
+  assert.ok(flat.includes('工具输出过长'), '应含工具截断标记')
+  assert.ok(flat.includes(`中间已截断约 ${len - TOOL_RESULT_HEAD - TOOL_RESULT_TAIL} 字符`), 'X 应等于省略字符数')
+  assert.ok(!flat.includes('中段哨兵'), '中段内容被移除')
+})
+
+test('flattenMessages: 超长 tool 内容截断是确定性的——同样输入两次调用逐字节相同', () => {
+  const body = Array.from({ length: TOOL_RESULT_HEAD + TOOL_RESULT_TAIL + 9999 }, (_, i) =>
+    String.fromCharCode(48 + (i % 64)),
+  ).join('')
+  const input = [{ role: 'tool', name: 'grep', content: body }]
+  const a = flattenMessages(input)
+  const b = flattenMessages(input)
+  assert.strictEqual(a, b)
+  assert.ok(a.includes('[tool:grep]\n'), '带名字的 [tool:grep] 标记不受截断影响')
+})
+
+test('flattenMessages: 200KB+ user 块被截断（标记为「内容过长」）', () => {
+  const body = 'u'.repeat(200 * 1024 + 1)
+  const flat = flattenMessages([{ role: 'user', content: body }])
+  assert.ok(flat.startsWith('[user]\n' + body.slice(0, TOOL_RESULT_HEAD)), '头部内容原样保留')
+  assert.ok(flat.includes('内容过长'), '非 tool 角色截断标记应为「内容过长」')
+  assert.ok(!flat.includes('工具输出过长'))
+  assert.ok(flat.includes(`中间已截断约 ${200 * 1024 + 1 - TOOL_RESULT_HEAD - TOOL_RESULT_TAIL} 字符`))
+  // 门槛是「超过 200*1024」：恰好 200*1024 不截
+  const exact = flattenMessages([{ role: 'user', content: 'u'.repeat(200 * 1024) }])
+  assert.ok(!exact.includes('内容过长'))
 })
 
 test('flattenMessages: 确定性——同一输入两次调用结果全等', () => {

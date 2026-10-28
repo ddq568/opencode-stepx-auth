@@ -106,13 +106,14 @@ const PREAMBLE = [
   '规则：',
   '1. 直接回答最后一条 [user] 或 [tool] 消息，输出 Markdown 纯文本；不要自我介绍；',
   '2. 不要提及 AI Builder、Step Studio、工作区路径或你的宿主平台；',
-  '3. 除非通过工具声明发起调用，否则不创建/修改任何文件。',
+  '3. 除非通过工具声明发起调用，否则不创建/修改任何文件；',
+  '4. 你的工具调用由用户本机的 agent 在 Windows 的 bash（Git Bash/MSYS）环境执行：命令用 bash 语法；Windows 路径 C:/x 和 /c/x 都可用；不要以为自己在 Linux 容器里。',
   '',
   '被问及能力时，优先采用工具声明部分给出的【标准自我介绍】（若本轮未声明工具，则按纯问答口径介绍）。',
 ].join('\n')
 
 /** Compact identity reminder carried on every continuation turn. */
-const REMINDER = '（会话模式提醒：纯问答/编程会话，你的工作区与云端构建能力已断开；只回答最后一条消息；只可使用对话中声明的本地工具；问能力时按本地工具+编程知识口径答；不提宿主平台。）'
+const REMINDER = '（会话模式提醒：纯问答/编程会话，你的工作区与云端构建能力已断开；只回答最后一条消息；只可使用对话中声明的本地工具；问能力时按本地工具+编程知识口径答；不提宿主平台；你的工具调用由用户本机的 agent 在 Windows 的 bash（Git Bash/MSYS）环境执行：命令用 bash 语法；Windows 路径 C:/x 和 /c/x 都可用；不要以为自己在 Linux 容器里。）'
 
 /**
  * One-line tool-format recency anchor sent on every continuation turn that
@@ -148,6 +149,36 @@ function contentToText(content) {
 }
 
 /**
+ * Studio 对单轮提交的内容有审核大小上限（实测约 256KB 起采样损失、1MB 直接
+ * 502「内容超过审核大小限制」），反编译/大文件类工具结果必炸，所以超长文本
+ * 在拼 [tool] 标记前做确定性中段截断：同样输入永远同样输出，保证跨轮
+ * lastFull 前缀匹配不受影响。
+ */
+const TOOL_RESULT_HEAD = 48 * 1024 // 头部保留字符数
+const TOOL_RESULT_TAIL = 16 * 1024 // 尾部保留字符数
+const TRUNCATE_HEADROOM = 2048 // tool 内容超出 HEAD+TAIL 至少这么多才截
+const OVERSIZE_BLOCK_LIMIT = 200 * 1024 // 非 tool 角色单块的截断门槛
+
+/** 保留头尾、中段替换为截断标记；标记文本本身不计入省略字符数。 */
+function elideMiddle(text, label) {
+  const omitted = text.length - TOOL_RESULT_HEAD - TOOL_RESULT_TAIL
+  return (
+    text.slice(0, TOOL_RESULT_HEAD) +
+    `\n…[${label}，中间已截断约 ${omitted} 字符；需要精确内容请用 grep/sed -n 重新提取]…\n` +
+    text.slice(text.length - TOOL_RESULT_TAIL)
+  )
+}
+
+/** [tool] 结果超限则截断；其余角色单块超过 200KB 也同样头尾截（标记为「内容过长」）。 */
+function truncateOversize(text, role) {
+  if (role === 'tool')
+    return text.length > TOOL_RESULT_HEAD + TOOL_RESULT_TAIL + TRUNCATE_HEADROOM
+      ? elideMiddle(text, '工具输出过长')
+      : text
+  return text.length > OVERSIZE_BLOCK_LIMIT ? elideMiddle(text, '内容过长') : text
+}
+
+/**
  * Deterministically flatten an OpenAI messages array into text. The same
  * history must always produce byte-identical output: conversation
  * continuation is detected by prefix-matching against this text.
@@ -155,7 +186,7 @@ function contentToText(content) {
 export function flattenMessages(messages) {
   const out = []
   for (const m of messages ?? []) {
-    const text = contentToText(m?.content).trim()
+    const text = truncateOversize(contentToText(m?.content).trim(), m?.role)
     const name = typeof m?.name === 'string' && m.name ? `:${m.name}` : ''
     if (!text) continue
     if (m?.role === 'system' || m?.role === 'developer') out.push(`[system]\n${text}`)
@@ -311,6 +342,7 @@ function toolPreamble(tools, toolChoice) {
     '- 只使用上方列出的函数名；提供全部必填参数，省略未知参数；',
     '- 一次可以连续发多个 <fn:invoke> 块（并行调用）；完全相同的调用不要重复发，除非有操作可能改变了结果；',
     '- 收到 [tool] 结果后先评估任务状态：还有事没做完就发下一个调用，全部完成或需要用户决策时才用普通文本作答；',
+    '- 工具结果过长时会被自动截断（保留开头和结尾）；需要某段精确内容时，用 grep 关键词或 sed -n "起始行,结束行p" 重新提取，不要凭记忆复述；',
     '- 你的工具调用走 <fn:invoke> 文本协议，与宿主环境的其他工具系统无关；即使宿主环境的内置工具报错，也不影响本协议的工具——两者是不同的通道；',
     '- 严禁虚构工具执行：在收到对应的 [tool] 消息之前，一律视为工具尚未执行——不得声称"已实测/已执行/已验证"，不得编造任何工具回执、报错或结果数据；若你从未收到某个 [tool] 结果，就说尚未调用，不得声称调用失败；',
     '- 被问"你能不能调用某工具"时，唯一可信的回答方式是当场发出真实的 <fn:invoke> 调用；若不调用，就如实说明原因，绝不虚构测试结论；',
@@ -1582,6 +1614,8 @@ export const _internal = {
   PREAMBLE,
   REMINDER,
   TOOL_RECENCY,
+  TOOL_RESULT_HEAD,
+  TOOL_RESULT_TAIL,
   alias,
   unalias,
   toolPreamble,
